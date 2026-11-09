@@ -1,1 +1,17 @@
-# paranoid-tg-proxy
+# paranoid-tg-proxy# Paranoid Telegram Web Proxy
+
+Скрипт для максимально скрытной установки Telegram Web Proxy. Настроен на жесткую защиту от сканирования ТСПУ и обход блокировок.
+
+## Архитектура защиты
+* **Маскировка:** Работает на 443 порту за Nginx с валидным SSL-сертификатом Let's Encrypt.
+* **Сайт-заглушка:** Для посторонних глаз и ботов отображается обычная страница-визитка.
+* **Скрытие интерфейса:** Доступ к Telegram закрыт через логин и пароль (Basic Auth).
+* **Глухая оборона:** UFW разрешает только 22, 80 и 443 порты.
+* **Бан сканеров РКН:** Подсети ГРЧЦ, CyberOK и F6 блокируются на уровне ядра через ipset.
+
+## Быстрая установка одной командой
+
+Выполни команду на сервере с Ubuntu 22.04/24.04 от имени `root`, заменив `tg.твойдомен.ru` на свой реальный домен:
+
+```bash
+bash <(curl -fsSL [https://raw.githubusercontent.com/lituslitus-cyber/paranoid-tg-proxy/main/install.sh](https://raw.githubusercontent.com/lituslitus-cyber/paranoid-tg-proxy/main/install.sh)) -d tg.твойдомен.ru
