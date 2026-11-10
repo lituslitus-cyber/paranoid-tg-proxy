@@ -67,6 +67,10 @@ if ss -ltn '( sport = :80 or sport = :443 )' | grep -q LISTEN && ! systemctl is-
   die "порты 80/443 уже заняты не Caddy. Установщик tproxy-server рассчитан на чистый сервер"
 fi
 
+if systemctl is-active --quiet caddy && [[ -s /etc/caddy/Caddyfile ]] && ! grep -qF "$DOMAIN" /etc/caddy/Caddyfile; then
+  die "на сервере уже работает Caddy с чужим конфигом. Установщик tproxy-server его заменит. Используй ручную интеграцию из документации upstream"
+fi
+
 # ---------- секрет (стабильный между перезапусками скрипта) ----------
 umask 077
 if [[ ! -s "$SECRET_FILE" ]]; then
@@ -98,10 +102,16 @@ info "Настройка блоклиста сканеров..."
 install -d -m 0755 /var/lib/rkn-blocklist
 
 # Админский IP, чтобы случайно не забанить себя
-ADMIN_IP="${SSH_CLIENT%% *}"
+ADMIN_IP="${SSH_CLIENT:-}"; ADMIN_IP="${ADMIN_IP%% *}"
+[[ -n "$ADMIN_IP" ]] || { ADMIN_IP="${SSH_CONNECTION:-}"; ADMIN_IP="${ADMIN_IP%% *}"; }
+[[ -n "$ADMIN_IP" ]] || ADMIN_IP="$(who -m 2>/dev/null | grep -oE '\(([0-9]+\.){3}[0-9]+\)' | tr -d '()' || true)"
 if [[ ! -f /etc/rkn-blocklist.allow ]]; then
   : > /etc/rkn-blocklist.allow
-  [[ "$ADMIN_IP" =~ ^[0-9]+(\.[0-9]+){3}$ ]] && echo "$ADMIN_IP" >> /etc/rkn-blocklist.allow
+  if [[ "$ADMIN_IP" =~ ^[0-9]+(\.[0-9]+){3}$ ]]; then
+    echo "$ADMIN_IP" >> /etc/rkn-blocklist.allow
+  else
+    echo "ВНИМАНИЕ: свой IP определить не удалось. Добавь его в /etc/rkn-blocklist.allow вручную, иначе возможна самоблокировка"
+  fi
 fi
 
 cat > /usr/local/sbin/rkn-blocklist-update.sh <<'UPDATE_EOF'
@@ -149,7 +159,7 @@ fi
 clean < "$ALLOW" > "$T/allow" 2>/dev/null || : > "$T/allow"
 
 {
-  echo "table inet rkn_block"
+  echo "table inet rkn_block { }"
   echo "delete table inet rkn_block"
   echo "table inet rkn_block {"
   echo "  set rkn4 { type ipv4_addr; flags interval; auto-merge; elements = { $(paste -sd, "$CACHE") } }"
@@ -166,7 +176,11 @@ clean < "$ALLOW" > "$T/allow" 2>/dev/null || : > "$T/allow"
 } > "$T/rules.nft"
 
 # Проверка и атомарное применение: при ошибке старая таблица остаётся нетронутой
-nft -c -f "$T/rules.nft"
+if ! nft -c -f "$T/rules.nft"; then
+  echo "ОШИБКА: nft не принял правила, файл:" >&2
+  head -c 2000 "$T/rules.nft" >&2
+  exit 1
+fi
 nft -f "$T/rules.nft"
 echo "Блоклист применён: $(wc -l < "$CACHE") записей"
 UPDATE_EOF
@@ -225,6 +239,7 @@ else
   echo "  сайт недоступен по HTTPS или ответы различаются: FAIL"; fail=1
 fi
 
+nft list table inet tproxy_backend >/dev/null 2>&1 && echo "  firewall tproxy_backend: OK" || { echo "  firewall tproxy_backend: FAIL (порты 2398/8888 могут быть открыты снаружи)"; fail=1; }
 nft list set inet rkn_block rkn4 >/dev/null 2>&1 && echo "  блоклист в nftables: OK" || { echo "  блоклист в nftables: FAIL"; fail=1; }
 
 echo
