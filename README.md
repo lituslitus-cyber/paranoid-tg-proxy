@@ -15,3 +15,11 @@
 
 ```bash
 bash <(curl -fsSL [https://raw.githubusercontent.com/lituslitus-cyber/paranoid-tg-proxy/main/install.sh](https://raw.githubusercontent.com/lituslitus-cyber/paranoid-tg-proxy/main/install.sh)) -d tg.твойдомен.ru
+```
+Автоматическое обновление списков блокировки
+Списки IP-адресов сканеров загружаются один раз при установке. Чтобы сервер обновлял их автоматически (каждую ночь в 03:00), просто скопируй и выполни в терминале эту команду:
+```
+(crontab -l 2>/dev/null; echo "0 3 * * * /usr/local/sbin/rkn-blocklist-update.sh >/dev/null 2>&1") | crontab -
+```
+Команда `crontab -l | crontab -` аккуратно допишет нужное правило в планировщик задач без открытия текстового редактора. Вставил в терминал, нажал Enter — и автоматическое обновление настроено навсегда. 
+
