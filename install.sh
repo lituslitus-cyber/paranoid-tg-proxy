@@ -24,7 +24,45 @@ on_error() { echo "ERROR at line $1, code $2; see service logs. Existing backups
 trap 'on_error "$LINENO" "$?"' ERR
 [[ $EUID -eq 0 ]] || die 'Run as root'
 [[ $(uname -m) == x86_64 ]] || die 'Upstream MTProxy requires x86_64'
-[[ -r "$SITE/index.html" ]] || die "Missing readable real site: $SITE/index.html"
+# A site is required by upstream. On fresh installs create an actual, readable,
+# original static homepage rather than stopping on missing index.html.
+# Existing user website files are never overwritten.
+if (( ! CHECK_ONLY )) && [[ ! -f "$SITE/index.html" ]]; then
+  say 'Creating original static homepage (no third-party tracking or dependencies)'
+  install -d -m 0755 "$SITE"
+  cat > "$SITE/index.html" <<'HTML'
+<!doctype html>
+<html lang="ru">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width,initial-scale=1">
+  <meta name="referrer" content="no-referrer">
+  <title>MaxMir — цифровые заметки</title>
+  <meta name="description" content="Небольшие заметки о технологиях, организации цифровых данных и приватности.">
+  <style>
+    :root{color-scheme:light;--ink:#183044;--accent:#23709c;--paper:#f6f9fb}
+    *{box-sizing:border-box}body{margin:0;font:17px/1.65 system-ui,-apple-system,sans-serif;color:var(--ink);background:var(--paper)}
+    header,main,footer{max-width:880px;margin:auto;padding:32px 24px}
+    header{padding-top:70px}h1{font-size:clamp(2rem,5vw,3.5rem);line-height:1.18;margin:0 0 16px}h2{font-size:1.3rem;margin:0 0 12px}
+    .lead{font-size:1.2rem;max-width:660px;color:#405769}.panel{background:white;border:1px solid #dce5ea;border-radius:16px;padding:26px;margin:20px 0}
+    a{color:var(--accent)}footer{font-size:.9rem;color:#637785}
+  </style>
+</head>
+<body>
+<header><p>MAXMIR / ЦИФРОВЫЕ ЗАМЕТКИ</p><h1>Простые технологии для повседневных задач</h1>
+<p class="lead">Заметки об организации информации, надёжности сервисов и внимательном отношении к цифровым инструментам.</p></header>
+<main><section class="panel"><h2>Организация цифровых данных</h2>
+<p>Резервное копирование, структура папок, проверка источников и контроль версий помогают сохранять важное и упрощают работу.</p></section>
+<section class="panel"><h2>Приватность и устойчивость</h2>
+<p>Обновления, защищённые соединения и минимальный сбор данных полезны как для личных проектов, так и для небольших сайтов.</p></section>
+<section class="panel"><h2>О сайте</h2><p>Небольшой независимый информационный проект. Здесь не используются сторонние шрифты, рекламные счётчики и cookies для отслеживания.</p></section></main>
+<footer>© MaxMir · Информационные заметки</footer>
+</body>
+</html>
+HTML
+  chmod 0644 "$SITE/index.html"
+fi
+[[ -r "$SITE/index.html" ]] || die "Site unreadable: $SITE/index.html"
 [[ "$DOMAIN" =~ ^([a-z0-9][a-z0-9-]*\.)+[a-z0-9][a-z0-9-]*$ ]] || die 'Invalid hostname'
 [[ "$EMAIL" =~ ^[A-Za-z0-9._+-]+@[A-Za-z0-9.-]+\.[A-Za-z]{2,}$ ]] || die 'Invalid ACME email'
 if (( CHECK_ONLY )); then
