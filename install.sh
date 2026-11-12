@@ -55,7 +55,10 @@ SITE_DIR="$(realpath "$SITE_DIR")"
 
 info "Установка зависимостей (без apt upgrade)..."
 apt-get update -y
-apt-get install -y --no-install-recommends git curl ca-certificates nftables dnsutils openssl iproute2
+apt-get install -y --no-install-recommends git curl ca-certificates nftables openssl iproute2
+# dig: в Debian 13 и свежих Ubuntu пакет называется bind9-dnsutils, в старых dnsutils
+apt-get install -y --no-install-recommends bind9-dnsutils || apt-get install -y --no-install-recommends dnsutils
+command -v dig >/dev/null || die "не удалось установить dig (bind9-dnsutils)"
 
 MYIP="$(curl -4fsS --max-time 10 https://api.ipify.org || true)"
 [[ -n "$MYIP" ]] || die "не удалось определить внешний IPv4 сервера"
