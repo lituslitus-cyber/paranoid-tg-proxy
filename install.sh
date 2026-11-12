@@ -1,263 +1,236 @@
 #!/usr/bin/env bash
-# paranoid-tg-proxy v2
-# Обёртка над telegramdesktop/tproxy-server (WEB proxy для Telegram)
-# + блоклист сканеров на nftables, который переживает перезагрузку.
-#
-# Использование:
-#   sudo bash install.sh -d proxy.example.com -e you@example.com -s /путь/к/сайту
-#
-# -d  домен (строчными, A-запись уже указывает на этот сервер)
-# -e  почта для Let's Encrypt
-# -s  каталог СВОЕГО статического сайта (обязателен index.html)
-#
-# Переменные окружения: TPROXY_REF (ветка или тег tproxy-server, по умолчанию master)
-
+# WEB proxy installer for dedicated Debian/Ubuntu VPS; uses upstream tproxy-server.
+# Usage: sudo bash install_paranoid_webproxy.sh [--check] [--no-blocklist]
 set -Eeuo pipefail
-trap 'echo "ОШИБКА: строка $LINENO, код $?. Установка остановлена." >&2' ERR
-
-REPO_URL="https://github.com/telegramdesktop/tproxy-server"
-REPO_REF="${TPROXY_REF:-master}"
-SRC_DIR="/opt/tproxy-server-src"
-SECRET_FILE="/root/.tg-proxy-secret"
-export DEBIAN_FRONTEND=noninteractive
-
-die()  { echo "ОШИБКА: $*" >&2; exit 1; }
-info() { echo ">>> $*"; }
-usage() { die "Использование: sudo bash $0 -d proxy.example.com -e you@example.com -s /путь/к/сайту"; }
-
-DOMAIN=""; EMAIL=""; SITE_DIR=""
-while getopts d:e:s: f; do
-  case "$f" in
-    d) DOMAIN="$OPTARG" ;;
-    e) EMAIL="$OPTARG" ;;
-    s) SITE_DIR="$OPTARG" ;;
-    *) usage ;;
+umask 077
+DOMAIN='puh.maxmir.ru'
+EMAIL='lituslitus@gmail.com'
+SITE='/var/www/puh.maxmir.ru'
+UPSTREAM='https://github.com/telegramdesktop/tproxy-server.git'
+SOURCE='/opt/tproxy-server-src'
+STATE='/etc/paranoid-webproxy'
+BLOCKLIST=1
+CHECK_ONLY=0
+for arg in "$@"; do
+  case "$arg" in
+    --check) CHECK_ONLY=1 ;;
+    --no-blocklist) BLOCKLIST=0 ;;
+    *) echo "Unknown option: $arg" >&2; exit 2 ;;
   esac
 done
-[[ -n "$DOMAIN" && -n "$EMAIL" && -n "$SITE_DIR" ]] || usage
-
-# ---------- проверки до любых изменений ----------
-[[ $EUID -eq 0 ]] || die "нужен root (sudo)"
-[[ "$(uname -m)" == "x86_64" ]] || die "tproxy-server ставится только на x86_64"
-
+say() { printf '\n==> %s\n' "$*"; }
+die() { echo "ERROR: $*" >&2; exit 1; }
+on_error() { echo "ERROR at line $1, code $2; see service logs. Existing backups retained in $STATE/backups" >&2; }
+trap 'on_error "$LINENO" "$?"' ERR
+[[ $EUID -eq 0 ]] || die 'Run as root'
+[[ $(uname -m) == x86_64 ]] || die 'Upstream MTProxy requires x86_64'
+[[ -r "$SITE/index.html" ]] || die "Missing readable real site: $SITE/index.html"
+[[ "$DOMAIN" =~ ^([a-z0-9][a-z0-9-]*\.)+[a-z0-9][a-z0-9-]*$ ]] || die 'Invalid hostname'
+[[ "$EMAIL" =~ ^[A-Za-z0-9._+-]+@[A-Za-z0-9.-]+\.[A-Za-z]{2,}$ ]] || die 'Invalid ACME email'
+if (( CHECK_ONLY )); then
+  say 'Systemd states'
+  systemctl is-active caddy mtproxy tproxy-server tproxy-firewall || true
+  say 'Listening sockets (no credentials)'
+  ss -lntp '( sport = :80 or sport = :443 or sport = :8080 or sport = :8081 or sport = :2398 or sport = :8888 )' || true
+  say 'Ready endpoint'
+  curl -fsS --max-time 5 http://127.0.0.1:8081/readyz || true
+  echo
+  say 'HTTPS public site'
+  curl -sS --max-time 15 -o /dev/null -w 'HTTP code: %{http_code}, TLS verify: %{ssl_verify_result}\n' "https://$DOMAIN/" || true
+  say 'Firewall tables'
+  nft list table inet tproxy_backend >/dev/null 2>&1 && echo 'tproxy_backend exists' || echo 'WARNING: tproxy_backend missing'
+  nft list table inet paranoid_scanners >/dev/null 2>&1 && echo 'scanner table exists' || echo 'scanner table not installed'
+  say 'Config summary (no secrets)'
+  python3 - <<'PY' || true
+import json
+p='/etc/tproxy-server/config.json'
+try:
+ c=json.load(open(p)); print('hostname:', c.get('public_hostname')); print('base_path:', c.get('base_path')); print('listen:', c.get('listen'))
+except Exception as e: print('Config not available:',type(e).__name__)
+PY
+  exit 0
+fi
 . /etc/os-release
-case "${ID:-}" in
-  ubuntu) dpkg --compare-versions "${VERSION_ID:-0}" ge 22.04 || die "нужен Ubuntu 22.04+" ;;
-  debian) dpkg --compare-versions "${VERSION_ID:-0}" ge 12    || die "нужен Debian 12+" ;;
-  *) die "поддерживаются только Ubuntu 22.04+ и Debian 12+" ;;
+case "$ID" in
+  debian) dpkg --compare-versions "$VERSION_ID" ge 12 || die 'Debian 12+ required' ;;
+  ubuntu) dpkg --compare-versions "$VERSION_ID" ge 22.04 || die 'Ubuntu 22.04+ required' ;;
+  *) die 'Only Debian/Ubuntu are supported' ;;
 esac
-
-[[ "$DOMAIN" =~ ^([a-z0-9]([a-z0-9-]*[a-z0-9])?\.)+[a-z0-9-]{2,}$ ]] \
-  || die "домен должен быть строчным ASCII (для IDN используй xn--...)"
-[[ "$EMAIL" =~ ^[^@[:space:]]+@[^@[:space:]]+\.[^@[:space:]]+$ ]] || die "некорректная почта"
-[[ -f "$SITE_DIR/index.html" ]] || die "в $SITE_DIR нет index.html. Нужен свой настоящий сайт, готовую заглушку использовать нельзя (это сигнатура для сканеров)"
-SITE_DIR="$(realpath "$SITE_DIR")"
-
-info "Установка зависимостей (без apt upgrade)..."
-apt-get update -y
-apt-get install -y --no-install-recommends git curl ca-certificates nftables openssl iproute2
-# dig: в Debian 13 и свежих Ubuntu пакет называется bind9-dnsutils, в старых dnsutils
-apt-get install -y --no-install-recommends bind9-dnsutils || apt-get install -y --no-install-recommends dnsutils
-command -v dig >/dev/null || die "не удалось установить dig (bind9-dnsutils)"
-
-MYIP="$(curl -4fsS --max-time 10 https://api.ipify.org || true)"
-[[ -n "$MYIP" ]] || die "не удалось определить внешний IPv4 сервера"
-RESOLVED="$(dig +short A "$DOMAIN" | grep -E '^[0-9]+(\.[0-9]+){3}$' || true)"
-grep -qx "$MYIP" <<<"$RESOLVED" \
-  || die "$DOMAIN резолвится в '${RESOLVED:-ничего}', а IP сервера $MYIP. Поправь A-запись и подожди обновления DNS"
-
+say 'Preflight: DNS and public IPv4'
+command -v curl >/dev/null || { apt-get update; apt-get install -y curl ca-certificates; }
+PUBLIC_IP=$(curl -4fsS --connect-timeout 5 --max-time 12 https://api.ipify.org) || die 'Cannot identify public IPv4'
+[[ "$PUBLIC_IP" =~ ^([0-9]{1,3}\.){3}[0-9]{1,3}$ ]] || die 'Invalid public IPv4'
+DNS_A=$(getent ahostsv4 "$DOMAIN" | awk '{print $1}' | sort -u) || die 'Domain DNS lookup failed'
+grep -Fxq "$PUBLIC_IP" <<< "$DNS_A" || die "DNS mismatch. public=$PUBLIC_IP, DNS=$DNS_A"
+[[ -z $(getent ahostsv6 "$DOMAIN" 2>/dev/null || true) ]] || echo 'WARNING: hostname has IPv6 answers. Verify IPv6 reachability separately.'
 if ss -ltn '( sport = :80 or sport = :443 )' | grep -q LISTEN && ! systemctl is-active --quiet caddy; then
-  die "порты 80/443 уже заняты не Caddy. Установщик tproxy-server рассчитан на чистый сервер"
+  die 'Port 80/443 is occupied by a service other than Caddy'
 fi
-
-if systemctl is-active --quiet caddy && [[ -s /etc/caddy/Caddyfile ]] && ! grep -qF "$DOMAIN" /etc/caddy/Caddyfile; then
-  die "на сервере уже работает Caddy с чужим конфигом. Установщик tproxy-server его заменит. Используй ручную интеграцию из документации upstream"
-fi
-
-# ---------- секрет (стабильный между перезапусками скрипта) ----------
-umask 077
-if [[ ! -s "$SECRET_FILE" ]]; then
-  openssl rand -hex 16 > "$SECRET_FILE"
-fi
-chmod 600 "$SECRET_FILE"
-SECRET="$(tr -d '[:space:]' < "$SECRET_FILE")"
-[[ "$SECRET" =~ ^[0-9a-f]{32}$ ]] || die "секрет в $SECRET_FILE повреждён (нужно 32 hex-символа)"
-umask 022
-
-# ---------- tproxy-server ----------
-info "Загрузка tproxy-server ($REPO_REF)..."
-if [[ -d "$SRC_DIR/.git" ]]; then
-  git -C "$SRC_DIR" fetch --depth 1 origin "$REPO_REF"
-  git -C "$SRC_DIR" checkout -q FETCH_HEAD
+say 'Install dependencies'
+apt-get update
+apt-get install -y --no-install-recommends git curl ca-certificates openssl nftables iproute2 python3 coreutils
+install -d -m 0700 "$STATE" "$STATE/backups"
+# Backup configurations before invoking the upstream installer (which replaces Caddyfile).
+BACKUP="$STATE/backups/$(date -u +%Y%m%dT%H%M%SZ)"
+install -d -m 0700 "$BACKUP"
+for file in /etc/caddy/Caddyfile /etc/tproxy-server/config.json /etc/tproxy-server/profiles.json /etc/mtproxy/mtproxy.env /root/.tg-proxy-secret; do
+  if [[ -f "$file" ]]; then install -d -m 0700 "$BACKUP$(dirname "$file")"; cp -a "$file" "$BACKUP$file"; fi
+done
+say 'Fetch latest upstream source'
+if [[ -d "$SOURCE/.git" ]]; then
+  git -C "$SOURCE" fetch --depth 1 origin master
+  git -C "$SOURCE" checkout --detach -q FETCH_HEAD
 else
-  git clone --depth 1 --branch "$REPO_REF" "$REPO_URL" "$SRC_DIR"
+  [[ ! -e "$SOURCE" ]] || die "$SOURCE exists but is not a Git checkout"
+  git clone --depth 1 --branch master "$UPSTREAM" "$SOURCE"
 fi
-COMMIT="$(git -C "$SRC_DIR" rev-parse HEAD)"
-info "Версия tproxy-server: $COMMIT"
-
-info "Запуск официального установщика (Caddy, MTProxy, relay, nftables)..."
-echo "    Внимание: он заменит активный Caddyfile (старый будет сохранён)."
-( cd "$SRC_DIR" && bash ./deploy/install.sh \
-    --hostname "$DOMAIN" --email "$EMAIL" --site-dir "$SITE_DIR" --secret "$SECRET" )
-
-# ---------- блоклист сканеров (nftables, переживает ребут) ----------
-info "Настройка блоклиста сканеров..."
-install -d -m 0755 /var/lib/rkn-blocklist
-
-# Админский IP, чтобы случайно не забанить себя
-ADMIN_IP="${SSH_CLIENT:-}"; ADMIN_IP="${ADMIN_IP%% *}"
-[[ -n "$ADMIN_IP" ]] || { ADMIN_IP="${SSH_CONNECTION:-}"; ADMIN_IP="${ADMIN_IP%% *}"; }
-[[ -n "$ADMIN_IP" ]] || ADMIN_IP="$(who -m 2>/dev/null | grep -oE '\(([0-9]+\.){3}[0-9]+\)' | tr -d '()' || true)"
-if [[ ! -f /etc/rkn-blocklist.allow ]]; then
-  : > /etc/rkn-blocklist.allow
-  if [[ "$ADMIN_IP" =~ ^[0-9]+(\.[0-9]+){3}$ ]]; then
-    echo "$ADMIN_IP" >> /etc/rkn-blocklist.allow
-  else
-    echo "ВНИМАНИЕ: свой IP определить не удалось. Добавь его в /etc/rkn-blocklist.allow вручную, иначе возможна самоблокировка"
-  fi
-fi
-
-cat > /usr/local/sbin/rkn-blocklist-update.sh <<'UPDATE_EOF'
-#!/usr/bin/env bash
-# Аргумент --cached: не качать списки, взять из кэша (для загрузки системы)
-set -euo pipefail
-STATE=/var/lib/rkn-blocklist
-CACHE="$STATE/ipv4.txt"
-ALLOW=/etc/rkn-blocklist.allow
-URLS=(
-  https://raw.githubusercontent.com/shadow-netlab/traffic-guard-lists/refs/heads/main/public/antiscanner.list
-  https://raw.githubusercontent.com/tread-lightly/CyberOK_Skipa_ips/refs/heads/main/lists/skipa_cidr.txt
+COMMIT=$(git -C "$SOURCE" rev-parse HEAD)
+echo "Upstream commit: $COMMIT"
+# Ensure upstream installer supports path-bound client links and NAT handling.
+grep -Fq -- '--base-path' "$SOURCE/deploy/install.sh" || die 'Upstream installer missing --base-path'
+grep -Fq -- 'MTPROXY_NAT_ARGS' "$SOURCE/deploy/install.sh" || die 'Upstream installer missing NAT handling'
+# Keep the existing path, but rotate compromised credentials from shared logs.
+# A new prefix is generated only for a fresh deployment.
+if [[ -f /etc/tproxy-server/config.json ]]; then
+  BASE_PATH=$(python3 - <<'PY'
+import json
+print(json.load(open('/etc/tproxy-server/config.json')).get('base_path',''))
+PY
 )
-EXTRA=(85.142.100.0/24 46.161.48.0/22 95.215.0.0/24 45.91.64.0/24)
-
-T="$(mktemp -d)"; trap 'rm -rf "$T"' EXIT
-mkdir -p "$STATE"
-
-# Только IPv4 или IPv4/CIDR, октеты <=255, префикс 8..32 (защита от /0 и мусора)
-clean() {
-  sed -e 's/#.*//' -e 's/[[:space:]]//g' \
-    | grep -E '^([0-9]{1,3}\.){3}[0-9]{1,3}(/[0-9]{1,2})?$' \
-    | awk -F'[./]' 'NF>=4 { ok=1; for(i=1;i<=4;i++) if($i>255) ok=0; m=(NF==5)?$5:32; if(m>32||m<8) ok=0; if(ok) print }' \
-    | sort -u || true
-}
-
-if [[ "${1:-}" != "--cached" ]]; then
-  : > "$T/raw"
-  for u in "${URLS[@]}"; do
-    curl -fsSL --retry 3 --max-time 60 "$u" >> "$T/raw" 2>/dev/null || echo "WARN: не скачался $u" >&2
-    echo >> "$T/raw"
-  done
-  printf '%s\n' "${EXTRA[@]}" >> "$T/raw"
-  clean < "$T/raw" > "$T/new"
-  n=$(wc -l < "$T/new")
-  # Обновляем кэш только если скачалось похоже на правду, либо кэша ещё нет
-  if (( n >= 20 )) || [[ ! -s "$CACHE" ]]; then
-    install -m 0644 "$T/new" "$CACHE"
-  else
-    echo "WARN: скачалось только $n записей, оставляю прежний кэш" >&2
-  fi
+  [[ -n "$BASE_PATH" ]] || die 'Existing root-path deployment: refusing to silently migrate; review manually'
+else
+  BASE_PATH=$(head -c 10 /dev/urandom | base32 | tr 'A-Z' 'a-z')
 fi
-
-[[ -s "$CACHE" ]] || { echo "ОШИБКА: кэша блоклиста нет" >&2; exit 1; }
-clean < "$ALLOW" > "$T/allow" 2>/dev/null || : > "$T/allow"
-
-{
-  echo "table inet rkn_block { }"
-  echo "delete table inet rkn_block"
-  echo "table inet rkn_block {"
-  echo "  set rkn4 { type ipv4_addr; flags interval; auto-merge; elements = { $(paste -sd, "$CACHE") } }"
-  if [[ -s "$T/allow" ]]; then
-    echo "  set allow4 { type ipv4_addr; flags interval; auto-merge; elements = { $(paste -sd, "$T/allow") } }"
-  else
-    echo "  set allow4 { type ipv4_addr; flags interval; }"
-  fi
-  echo "  chain input { type filter hook input priority -10; policy accept;"
-  echo "    ip saddr @allow4 accept"
-  echo "    ip saddr @rkn4 drop"
-  echo "  }"
-  echo "}"
-} > "$T/rules.nft"
-
-# Проверка и атомарное применение: при ошибке старая таблица остаётся нетронутой
-if ! nft -c -f "$T/rules.nft"; then
-  echo "ОШИБКА: nft не принял правила, файл:" >&2
-  head -c 2000 "$T/rules.nft" >&2
+[[ "$BASE_PATH" =~ ^[a-zA-Z0-9][a-zA-Z0-9_/-]*$ && ${#BASE_PATH} -le 128 ]] || die 'Invalid base_path'
+SECRET=$(openssl rand -hex 16)
+# Preserve a new secret across failed retries only if the first attempt has written it.
+# This invocation deliberately rotates the existing credential.
+say 'Install upstream WEB relay + internal MTProxy + Caddy (rotating leaked secret)'
+# Upstream prints secrets; capture output in a root-only file, not the terminal transcript.
+UPLOG="$STATE/upstream-install.log"
+if ! ( cd "$SOURCE" && bash ./deploy/install.sh --hostname "$DOMAIN" --email "$EMAIL" --site-dir "$SITE" --base-path "$BASE_PATH" --static-routes exact --secret "$SECRET" ) > "$UPLOG" 2>&1; then
+  echo "Upstream installation failed. Root-only log: $UPLOG" >&2
+  sed -E 's/(secret|Secret|Proxy link|Proxy secret|mtproxy secret):.*/\1: [REDACTED]/' "$UPLOG" | tail -n 24 >&2
   exit 1
 fi
-nft -f "$T/rules.nft"
-echo "Блоклист применён: $(wc -l < "$CACHE") записей"
-UPDATE_EOF
-chmod 0755 /usr/local/sbin/rkn-blocklist-update.sh
-
-/usr/local/sbin/rkn-blocklist-update.sh || echo "ВНИМАНИЕ: блоклист не применился, прокси работает без него"
-
-cat > /etc/systemd/system/rkn-blocklist.service <<'UNIT_EOF'
+chmod 0600 "$UPLOG"
+# Legacy blocklist from paranoid-tg-proxy v2 includes input drops and can block
+# legitimate clients with dynamic IPs, including on SSH. Remove it after upstream
+# has successfully started, leaving its config files intact for audit.
+if [[ -f /usr/local/sbin/rkn-blocklist-update.sh ]]; then
+  systemctl disable --now rkn-blocklist.timer rkn-blocklist.service 2>/dev/null || true
+  if [[ -f /etc/systemd/system/nftables.service.d/rkn-blocklist.conf ]]; then
+    mv /etc/systemd/system/nftables.service.d/rkn-blocklist.conf "$BACKUP/rkn-blocklist.conf"
+    systemctl daemon-reload
+  fi
+  nft delete table inet rkn_block 2>/dev/null || true
+fi
+# Backstop upstream-generated link format: 0x70 prefix + hex-decoded 16-byte secret.
+install -m 0600 /dev/null "$STATE/client-link.txt"
+export DOMAIN BASE_PATH SECRET
+python3 - <<'PY' > "$STATE/client-link.txt"
+import os,base64,urllib.parse
+secret=bytes.fromhex(os.environ['SECRET'])
+marked=base64.urlsafe_b64encode(b'\x70'+secret).decode().rstrip('=')
+server=os.environ['DOMAIN']+'/'+os.environ['BASE_PATH']
+print('https://t.me/webproxy?'+urllib.parse.urlencode({'server':server,'secret':marked}))
+print('tg://webproxy?'+urllib.parse.urlencode({'server':server,'secret':marked}))
+PY
+chmod 0600 "$STATE/client-link.txt"
+# Scanner blocking only on the public WEB port. Keep SSH always accessible.
+# Do not load untrusted third-party blocklists into SSH/global firewall rules.
+if (( BLOCKLIST )); then
+  say 'Install optional scanner blocklist for TCP 443 only'
+  cat > /usr/local/sbin/paranoid-scanner-update <<'UPDATE'
+#!/usr/bin/env bash
+set -Eeuo pipefail
+umask 077
+F=/var/lib/paranoid-webproxy/scanner4.txt
+install -d -m 0700 /var/lib/paranoid-webproxy
+TMP=$(mktemp); RULES=$(mktemp); trap 'rm -f "$TMP" "$RULES"' EXIT
+# HTTPS-only source. On download failure, leave the existing rules untouched.
+curl --fail --silent --show-error --location --max-time 25 --retry 2 \
+  'https://raw.githubusercontent.com/shadow-netlab/traffic-guard-lists/refs/heads/main/public/antiscanner.list' > "$TMP"
+python3 - "$TMP" "$RULES" <<'PY'
+import sys,ipaddress
+values=set()
+for line in open(sys.argv[1]):
+ line=line.split('#',1)[0].strip()
+ if not line:continue
+ try:
+  net=ipaddress.ip_network(line,strict=False)
+  if net.version==4 and net.prefixlen >= 16:values.add(str(net))
+ except ValueError:pass
+if len(values)<20:raise SystemExit('blocklist too short; refusing update')
+with open(sys.argv[2],'w') as f:
+ f.write('add table inet paranoid_scanners\n')
+ f.write('add set inet paranoid_scanners scanner4 { type ipv4_addr; flags interval; auto-merge; }\n')
+ f.write('add chain inet paranoid_scanners input { type filter hook input priority -20; policy accept; }\n')
+ f.write('flush chain inet paranoid_scanners input\n')
+ f.write('flush set inet paranoid_scanners scanner4\n')
+ for i in sorted(values):f.write('add element inet paranoid_scanners scanner4 { '+i+' }\n')
+ f.write('add rule inet paranoid_scanners input tcp dport 443 ip saddr @scanner4 drop\n')
+PY
+# Create table/chain/set idempotently, then replace the data in one nft batch.
+nft add table inet paranoid_scanners 2>/dev/null || true
+nft list set inet paranoid_scanners scanner4 >/dev/null 2>&1 || \
+  nft 'add set inet paranoid_scanners scanner4 { type ipv4_addr; flags interval; auto-merge; }'
+nft list chain inet paranoid_scanners input >/dev/null 2>&1 || \
+  nft 'add chain inet paranoid_scanners input { type filter hook input priority -20; policy accept; }'
+sed -i '1,3d' "$RULES"
+nft -c -f "$RULES"
+nft -f "$RULES"
+install -m 0600 "$TMP" "$F"
+echo 'scanner rules updated; SSH and port 80 unaffected'
+UPDATE
+  chmod 0755 /usr/local/sbin/paranoid-scanner-update
+  cat > /etc/systemd/system/paranoid-scanner-update.service <<'UNIT'
 [Unit]
-Description=Update and apply scanner blocklist (nftables)
-After=network-online.target nftables.service
+Description=Refresh optional TCP 443 scanner filters
+After=network-online.target
 Wants=network-online.target
-
 [Service]
 Type=oneshot
-ExecStart=/usr/local/sbin/rkn-blocklist-update.sh
-UNIT_EOF
-
-cat > /etc/systemd/system/rkn-blocklist.timer <<'UNIT_EOF'
+ExecStart=/usr/local/sbin/paranoid-scanner-update
+[Install]
+WantedBy=multi-user.target
+UNIT
+  cat > /etc/systemd/system/paranoid-scanner-update.timer <<'UNIT'
 [Unit]
-Description=Daily scanner blocklist refresh
-
+Description=Refresh optional scanner filters daily
 [Timer]
 OnCalendar=daily
 RandomizedDelaySec=1h
 Persistent=true
-
 [Install]
 WantedBy=timers.target
-UNIT_EOF
-
-# Дистрибутивный nftables.service начинает с "flush ruleset": после старта или reload
-# возвращаем нашу таблицу из кэша (без сети, чтобы не тормозить загрузку).
-install -d /etc/systemd/system/nftables.service.d
-cat > /etc/systemd/system/nftables.service.d/rkn-blocklist.conf <<'DROPIN_EOF'
-[Service]
-ExecStartPost=-/usr/local/sbin/rkn-blocklist-update.sh --cached
-ExecReload=-/usr/local/sbin/rkn-blocklist-update.sh --cached
-DROPIN_EOF
-
-systemctl daemon-reload
-systemctl enable --now nftables.service
-systemctl enable --now rkn-blocklist.timer
-
-# ---------- проверка результата ----------
-info "Проверка..."
-fail=0
-curl -fsS http://127.0.0.1:8081/healthz >/dev/null && echo "  relay healthz: OK" || { echo "  relay healthz: FAIL"; fail=1; }
-curl -fsS http://127.0.0.1:8081/readyz  >/dev/null && echo "  relay readyz (MTProxy): OK" || { echo "  relay readyz: FAIL"; fail=1; }
-
-B1="$(curl -fsS --max-time 20 "https://$DOMAIN/" || true)"
-B2="$(curl -fsS --max-time 20 "https://$DOMAIN/?bridge=wrong" || true)"
-if [[ -n "$B1" && "$B1" == "$B2" ]]; then
-  echo "  публичный сайт и ответ на неверный bridge совпадают: OK"
-else
-  echo "  сайт недоступен по HTTPS или ответы различаются: FAIL"; fail=1
+UNIT
+  systemctl daemon-reload
+  systemctl enable --now paranoid-scanner-update.timer
+  systemctl enable paranoid-scanner-update.service
+  if ! /usr/local/sbin/paranoid-scanner-update; then
+    echo 'WARNING: scanner list could not be installed; proxy remains usable.' >&2
+  fi
 fi
-
-nft list table inet tproxy_backend >/dev/null 2>&1 && echo "  firewall tproxy_backend: OK" || { echo "  firewall tproxy_backend: FAIL (порты 2398/8888 могут быть открыты снаружи)"; fail=1; }
-nft list set inet rkn_block rkn4 >/dev/null 2>&1 && echo "  блоклист в nftables: OK" || { echo "  блоклист в nftables: FAIL"; fail=1; }
-
-echo
-echo "=========================================================="
-if (( fail )); then
-  echo "Установка завершена с ошибками, смотри выше и: journalctl -u tproxy-server -u mtproxy -u caddy"
-else
-  echo "Готово."
+say 'Post-install sanity checks'
+systemctl is-active --quiet caddy || die 'Caddy is not active'
+systemctl is-active --quiet mtproxy || die 'MTProxy backend is not active'
+systemctl is-active --quiet tproxy-server || die 'WEB relay is not active'
+curl -fsS --max-time 10 http://127.0.0.1:8081/readyz >/dev/null || die 'WEB relay not ready'
+curl -fsS --max-time 20 "https://$DOMAIN/" >/dev/null || die 'Public HTTPS site unavailable'
+# Test the authenticated path-bound bridge, not only the public site.
+BRIDGE=$(python3 - <<'BRIDGEPY'
+import os,hmac,hashlib,base64
+msg=('tdesktop-web-proxy-bridge-v2\n'+os.environ['DOMAIN']+'\n'+os.environ['BASE_PATH']).encode()
+print(base64.urlsafe_b64encode(hmac.new(bytes.fromhex(os.environ['SECRET']),msg,hashlib.sha256).digest()).decode().rstrip('='))
+BRIDGEPY
+)
+if ! curl -fsS --max-time 20 "https://$DOMAIN/$BASE_PATH/?bridge=$BRIDGE" | grep -q 'tproxy-init'; then
+  die 'Authenticated WEB bridge failed; verify Caddy, secret and base_path'
 fi
-echo "Hostname: $DOMAIN"
-echo "Secret:   $SECRET   (хранится в $SECRET_FILE)"
-echo "Ссылка:   https://t.me/webproxy?server=$DOMAIN&secret=$SECRET"
-echo "          tg://webproxy?server=$DOMAIN&secret=$SECRET"
-echo "tproxy-server: $COMMIT"
-echo "Белый список IP для блоклиста: /etc/rkn-blocklist.allow"
-echo "В файрволе хостера открой только 22, 80, 443."
-echo "=========================================================="
-exit "$fail"
+nft list table inet tproxy_backend >/dev/null || die 'MTProxy backend firewall table missing'
+# Read private URL as root only; do not print secret into installation logs.
+echo "SUCCESS: services and HTTPS respond. Link saved to $STATE/client-link.txt (root-only)."
+echo 'To show link: sudo cat /etc/paranoid-webproxy/client-link.txt'
+echo 'To recheck: sudo bash install_paranoid_webproxy.sh --check'
+echo 'NOTE: Only a WEB-proxy-capable Telegram client can use this link. No blocking immunity is possible.'
